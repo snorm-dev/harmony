@@ -4,6 +4,7 @@
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#include "charm.h"
 #endif
 
 #define NEW_STUFF
@@ -151,7 +152,6 @@ struct results_block {
 // holds the states that hash onto the index into the array.
 struct shard {
     struct dict *states;          // maps states to nodes
-    struct state_header **peers;  // peers[nshards]
 
     struct results_block *todo_buffer, *tb_head, *tb_tail;
     unsigned int tb_size, tb_index;
@@ -171,6 +171,8 @@ struct worker {
 
     unsigned int vproc;          // virtual processor for pinning
     struct failure *failures;    // list of discovered failures (not data races)
+
+    struct state_header **peers;  // peers[nshards]
 
     // The worker thread loop through three phases:
     //  1: model check part of the state space
@@ -733,10 +735,12 @@ static void process_step(
     w->sb_index = (w->sb_index + 7) & ~7;
 
     // Add to the linked list of the responsible peer shard
-    struct shard *shard = &global.shards[shard_index];
-    unsigned int responsible = (sh->hash >> 16) % global.nshards;
-    sh->next = shard->peers[responsible];
-    shard->peers[responsible] = sh;
+    unsigned int shard_responsible = (sh->hash >> 16) % global.nshards;
+    unsigned int workers_per_shard = global.workers_per_shard[shard_responsible];
+    unsigned int responsible = (sh->hash >> 8) % global.workers_per_shard[shard_responsible] + global.first_worker_per_shard[shard_responsible];
+    sh->next = w->peers[responsible];
+
+    w->peers[responsible] = sh;
 }
 
 // This is the main workhorse function of model checking: explore a state and
@@ -2475,7 +2479,7 @@ static void do_work(struct worker *w, unsigned int shard_index){
     struct shard *shard = &global.shards[shard_index];
 
     // printf("WORK 1: %u: %u %u\n", w->index, shard->tb_index, shard->tb_size);
-    memset(shard->peers, 0, global.nshards * sizeof(*shard->peers));
+    memset(w->peers, 0, global.nshards * sizeof(*w->peers));
     while (shard->tb_index < shard->tb_size) {
 		// printf("WORK 1: %u: do %u\n", w->index, shard->tb_index);
         struct node *n = shard->tb_head->results[shard->tb_index % NRESULTS];
@@ -2498,9 +2502,9 @@ static void do_work2(struct worker *w, unsigned int shard_index){
 
     // printf("WORK 2: %u: %u %lu\n", w->index, shard->sb_index, sizeof(shard->state_buffer));
 
-    for (unsigned int i = 0; i < global.nshards; i++) {
-        struct shard *s2 = &global.shards[i];
-        for (struct state_header *sh = s2->peers[shard_index]; sh != NULL; sh = sh->next) {
+    for (unsigned int i = 0; i < global.nworkers; i++) {
+        struct worker *w2 = &global.workers[i];
+        for (struct state_header *sh = w2->peers[w->index]; sh != NULL; sh = sh->next) {
             struct state *sc = (struct state *) &sh[1];
             unsigned int size = state_size(sc);
 
@@ -3920,18 +3924,19 @@ int exec_model_checker(int argc, char **argv){
     atomic_init(&global.sh_index2, 0);
 
     // Allocate space for worker info
-    struct worker *workers = calloc(global.nworkers, sizeof(*workers));
+    global.workers = calloc(global.nworkers, sizeof(*global.workers));
     for (unsigned int i = 0; i < global.nworkers; i++) {
-        struct worker *w = &workers[i];
+        struct worker *w = &global.workers[i];
 
         w->timeout = timeout;
         w->start_barrier = &start_barrier;
         w->middle_barrier = &middle_barrier;
         w->end_barrier = &end_barrier;
         w->index = i;
-        w->workers = workers;
+        w->workers = global.workers;
         w->nworkers = global.nworkers;
         w->profile = calloc(global.code.len, sizeof(*w->profile));
+        w->peers = calloc(global.nworkers, sizeof(*w->peers));
 
         // Create a context for evaluating invariants
         w->inv_step.ctx = calloc(1, sizeof(struct context) +
@@ -3970,8 +3975,7 @@ int exec_model_checker(int argc, char **argv){
     for (unsigned int si = 0; si < NUM_SHARDS; si++) {
         struct shard *shard = &global.shards[si];
         shard->states = dict_new("shard states", sizeof(struct node), 0, global.nworkers, false);
-        shard->peers = calloc(global.nshards, sizeof(*shard->peers));
-        shard->todo_buffer = shard->tb_head = shard->tb_tail = walloc_fast(&workers[si % global.nworkers], sizeof(*shard->tb_tail));
+        shard->todo_buffer = shard->tb_head = shard->tb_tail = walloc_fast(&global.workers[si % global.nworkers], sizeof(*shard->tb_tail));
         shard->todo_buffer->nresults = 0;
         shard->todo_buffer->next = NULL;
         if (NUM_SHARDS < global.nworkers) {
@@ -3983,7 +3987,7 @@ int exec_model_checker(int argc, char **argv){
     printf("Pre tree alloc\n");
     // Pin workers to particular virtual processors
     unsigned int worker_index = 0;
-    vproc_tree_alloc(vproc_root, workers, &worker_index, global.nworkers);
+    vproc_tree_alloc(vproc_root, global.workers, &worker_index, global.nworkers);
 
     // Prefer to allocate memory at the memory bank attached to the first worker.
     // The main advantage of this is that if the entire Kripke structure is stored
@@ -4006,7 +4010,7 @@ int exec_model_checker(int argc, char **argv){
     bool new;
 #ifdef NUM_SHARDS
     mutex_t *lock;
-    struct dict_assoc *hn = dict_find_new(global.shards[0].states, &workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, &lock, meiyan((char *) state, state_size(state)));
+    struct dict_assoc *hn = dict_find_new(global.shards[0].states, &global.workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, &lock, meiyan((char *) state, state_size(state)));
 #else
     struct dict_assoc *hn = dict_find_new(global.shards[0].states, &workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, NULL, meiyan((char *) state, state_size(state)));
 #endif
@@ -4053,13 +4057,13 @@ int exec_model_checker(int argc, char **argv){
 
     // Start all but one of the workers. All will wait on the start barrier
     for (unsigned int i = 1; i < global.nworkers; i++) {
-        thread_create(worker, &workers[i]);
+        thread_create(worker, &global.workers[i]);
     }
 
     double before = gettime();
 
     // Run the last worker.  When it terminates the model checking is done.
-    worker(&workers[0]);
+    worker(&global.workers[0]);
 
 #ifdef NEW_STUFF
     unsigned int nstates = 0;
@@ -4086,7 +4090,7 @@ int exec_model_checker(int argc, char **argv){
 #ifdef REPORT_WORKERS
     double phase1 = 0, phase2a = 0, phase2b = 0, phase3 = 0, start_wait = 0, middle_wait = 0, end_wait = 0;
     for (unsigned int i = 0; i < global.nworkers; i++) {
-        struct worker *w = &workers[i];
+        struct worker *w = &global.workers[i];
         allocated += w->allocated;
         phase1 += w->phase1;
         phase2a += w->phase2a;
@@ -4131,7 +4135,7 @@ int exec_model_checker(int argc, char **argv){
     printf("    * %u states (time %.2lfs, mem=%.3lfGB)\n", global.graph.size, gettime() - before, (double) allocated / (1L << 30));
     unsigned int si_hits = 0, si_total = 0;
     for (unsigned int i = 0; i < global.nworkers; i++) {
-        struct worker *w = &workers[i];
+        struct worker *w = &global.workers[i];
         si_hits += w->si_hits;
         si_total += w->si_total;
     }
@@ -4324,11 +4328,11 @@ int exec_model_checker(int argc, char **argv){
 
                 if (global.nfinals > 0) {
                     struct step step;
-                    step_init(&workers[0], &step);
+                    step_init(&global.workers[0], &step);
 
                     // Check each "finally" predicate
                     for (unsigned int i = 0; i < global.nfinals; i++) {
-                        trystep(&workers[0], 0, node, -1, node_state(node), global.finals[i], &step, 0, -1);
+                        trystep(&global.workers[0], 0, node, -1, node_state(node), global.finals[i], &step, 0, -1);
                     }
                 }
             }
@@ -4518,7 +4522,7 @@ int exec_model_checker(int argc, char **argv){
         for (unsigned int pc = 0; pc < global.code.len; pc++) {
             unsigned int count = 0;
             for (unsigned int i = 0; i < global.nworkers; i++) {
-                struct worker *w = &workers[i];
+                struct worker *w = &global.workers[i];
                 count += w->profile[pc];
             }
             if (pc > 0) {

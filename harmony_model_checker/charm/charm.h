@@ -79,7 +79,11 @@ struct global {
     _Atomic(unsigned int) sh_index1; // shard index for phase 1
     _Atomic(unsigned int) sh_index2; // shard index for phase 2
 
+    unsigned int *workers_per_shard;
+    unsigned int *first_worker_per_shard;
+
     unsigned int nworkers;          // total number of threads
+    struct worker *workers;
     unsigned int ncomponents;       // to generate component identifiers
     struct failure *failures;       // queue of "struct failure"  (TODO: make part of struct node "issues")
     hvalue_t *processes;            // array of contexts of processes
