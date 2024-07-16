@@ -75,7 +75,12 @@
 #define STATE_BUFFER_SIZE   ((MAX_STATE_SIZE + sizeof(struct state_header)) * 10000)
 #define STATE_BUFFER_HWM    ((MAX_STATE_SIZE + sizeof(struct state_header)) *  9000)
 
-#define SHARDS_PER_WORKER   64
+#define NUM_SHARDS 2
+#ifndef NUM_SHARDS
+#define SHARDS_PER_WORKER   16
+#endif
+
+
 
 // All global variables should be here
 struct global global;
@@ -2502,8 +2507,13 @@ static void do_work2(struct worker *w, unsigned int shard_index){
             // See if this state has been computed before by looking up the node,
             // or allocate if not.
             bool new;
+#ifdef NUM_SHARDS
+            mutex_t *lock;
             struct dict_assoc *hn = dict_find_new(shard->states, &w->allocator,
-                        sc, size, sh->noutgoing * sizeof(struct edge), &new, NULL, sh->hash);
+                        sc, size, sh->noutgoing * sizeof(struct edge), &new, &lock, sh->hash);
+#else
+            struct dict_assoc *hn = dict_find_new(shard->states, &w->allocator, sc, size, sh->noutgoing * sizeof(struct edge), &new, NULL, sh->hash);
+#endif
             struct node *next = (struct node *) &hn[1];
             struct edge *edge = &node_edges(sh->node)[sh->edge_index];
             edge->dst = next;
@@ -2859,7 +2869,13 @@ static void worker(void *arg){
     for (;;) {
         // Wait for the first barrier (and keep stats)
         // This is where the worker is waiting for stabilizing hash tables
+        if (w->index == 1) {
+            // printf("WAIT FOR START %u\n", w->index);
+        }
         barrier_wait(w->start_barrier);
+        if (w->index == 1) {
+            // printf("DONE WITH START %u\n", w->index);
+        }
         double after = gettime();
         w->start_wait += after - before;
         w->start_count++;
@@ -2885,6 +2901,23 @@ static void worker(void *arg){
         before = after;
         nshards = 0;
 #ifndef notdef
+#ifdef NUM_SHARDS
+        w->sb_index = 0;
+        if (NUM_SHARDS < global.nworkers) {
+            // stabilize per-shard hashdict
+            for (unsigned int si = 0; si < NUM_SHARDS; si++) {
+                dict_make_stable(global.shards[si].states, w->index);
+            }
+            do_work(w, w->index % global.nshards);
+        } else for (;;) {
+            unsigned int shard_index = atomic_fetch_add(&global.sh_index1, 1);
+            if (shard_index >= global.nshards) {
+                break;
+            }
+            my_shards[nshards++] = shard_index;
+            do_work(w, shard_index);
+        }
+#else
         w->sb_index = 0;
         for (;;) {
             unsigned int shard_index = atomic_fetch_add(&global.sh_index1, 1);
@@ -2895,6 +2928,7 @@ static void worker(void *arg){
             my_shards[nshards++] = shard_index;
             do_work(w, shard_index);
         }
+#endif // NUM_SHARDS
 #else
         do_work(w, w->index);
 #endif
@@ -2907,15 +2941,30 @@ static void worker(void *arg){
         // Wait for others to finish, and keep stats
         // Here we are waiting for everybody's todo list processing
         before = after;
-        // printf("WAIT FOR MIDDLE %u\n", w->index);
+        if (w->index == 1) {
+            // printf("WAIT FOR MIDDLE %u\n", w->index);
+        }
         barrier_wait(w->middle_barrier);
-        // printf("DONE WITH MIDDLE %u\n", w->index);
+        if (w->index == 1) {
+            // printf("DONE WITH MIDDLE %u\n", w->index);
+        }
         after = gettime();
         w->middle_wait += after - before;
         w->middle_count++;
 
         before = after;
 #ifndef notdef
+#ifdef NUM_SHARDS
+        if (NUM_SHARDS < global.nworkers) {
+            do_work2(w, w->index % global.nshards);
+        } else for (;;) {
+            unsigned int shard_index = atomic_fetch_add(&global.sh_index2, 1);
+            if (shard_index >= global.nshards) {
+                break;
+            }
+            do_work2(w, shard_index);
+        }
+#else
 #ifdef XYZ
         for (unsigned int i = 0; i < nshards; i++) {
             // unsigned int shard_index = atomic_fetch_add(&global.sh_index2, 1);
@@ -2935,6 +2984,7 @@ static void worker(void *arg){
             do_work2(w, shard_index);
         }
 #endif // XYZ
+#endif // NUM_SHARDS
 #else
         do_work2(w, w->index);
 #endif
@@ -2973,13 +3023,23 @@ static void worker(void *arg){
         after = gettime();
         w->phase2b += after - before;
         before = after;
-        // printf("WAIT FOR END %u\n", w->index);
+        if (w->index >= 1) {
+            printf("WAIT FOR END %u\n", w->index);
+        }
         barrier_wait(w->end_barrier);
-        // printf("DONE WITH END %u\n", w->index);
+        if (w->index == 1) {
+            // printf("DONE WITH END %u\n", w->index);
+        }
         after = gettime();
         w->end_wait += after - before;
         w->end_count++;
         before = after;
+
+#ifdef NUM_SHARDS
+        if (NUM_SHARDS < global.nworkers && w->index < global.nshards) {
+            dict_grow_prepare(global.shards[w->index].states);
+        }
+#endif
 
         // In parallel, the workers copy the old hash table entries into the
         // new buckets.
@@ -3849,7 +3909,11 @@ int exec_model_checker(int argc, char **argv){
     global.computations = dict_new("computations", sizeof(struct step_condition), 0, global.nworkers, false);
 
     // Allocate the shards array.
+#ifdef NUM_SHARDS
+    global.nshards = NUM_SHARDS;
+#else
     global.nshards = global.nworkers * SHARDS_PER_WORKER;
+#endif
     global.shards = calloc(global.nshards, sizeof(*global.shards));
     printf("-> %p %u\n", global.shards, (unsigned int) (global.nshards * sizeof(*global.shards)));
     atomic_init(&global.sh_index1, 0);
@@ -3888,6 +3952,7 @@ int exec_model_checker(int argc, char **argv){
         w->allocator.ctx = w;
         w->allocator.worker = i;
 
+#ifdef SHARDS_PER_WORKER
         // Initialize the shards assigned to this worker
         unsigned int first_shard = i * SHARDS_PER_WORKER;
         for (unsigned int si = 0; si < SHARDS_PER_WORKER; si++) {
@@ -3898,8 +3963,24 @@ int exec_model_checker(int argc, char **argv){
             shard->todo_buffer->nresults = 0;
             shard->todo_buffer->next = NULL;
         }
+#endif
     }
 
+#ifdef NUM_SHARDS
+    for (unsigned int si = 0; si < NUM_SHARDS; si++) {
+        struct shard *shard = &global.shards[si];
+        shard->states = dict_new("shard states", sizeof(struct node), 0, global.nworkers, false);
+        shard->peers = calloc(global.nshards, sizeof(*shard->peers));
+        shard->todo_buffer = shard->tb_head = shard->tb_tail = walloc_fast(&workers[si % global.nworkers], sizeof(*shard->tb_tail));
+        shard->todo_buffer->nresults = 0;
+        shard->todo_buffer->next = NULL;
+        if (NUM_SHARDS < global.nworkers) {
+            dict_set_concurrent(shard->states);
+        }
+    }
+#endif
+
+    printf("Pre tree alloc\n");
     // Pin workers to particular virtual processors
     unsigned int worker_index = 0;
     vproc_tree_alloc(vproc_root, workers, &worker_index, global.nworkers);
@@ -3919,9 +4000,16 @@ int exec_model_checker(int argc, char **argv){
     dict_set_concurrent(global.values);
     dict_set_concurrent(global.computations);
 
+    printf("Post set concurrent\n");
+
 #ifdef NEW_STUFF
     bool new;
+#ifdef NUM_SHARDS
+    mutex_t *lock;
+    struct dict_assoc *hn = dict_find_new(global.shards[0].states, &workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, &lock, meiyan((char *) state, state_size(state)));
+#else
     struct dict_assoc *hn = dict_find_new(global.shards[0].states, &workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, NULL, meiyan((char *) state, state_size(state)));
+#endif
     struct node *node = (struct node *) &hn[1];
     memset(node, 0, sizeof(*node));
     node->initial = true;
@@ -3949,6 +4037,8 @@ int exec_model_checker(int argc, char **argv){
     graph_add(&global.graph, node);
 #endif
 
+    printf("Pre compute allocated\n");
+
 #ifdef NEW_STUFF
     // Compute how much table space is allocated
     // TODO.  Add per worker stuff
@@ -3958,6 +4048,8 @@ int exec_model_checker(int argc, char **argv){
     global.allocated = global.graph.size * sizeof(struct node *) +
         dict_allocated(visited) + dict_allocated(global.values);
 #endif
+
+    printf("Done init\n");
 
     // Start all but one of the workers. All will wait on the start barrier
     for (unsigned int i = 1; i < global.nworkers; i++) {
@@ -4055,6 +4147,13 @@ int exec_model_checker(int argc, char **argv){
 
     // Put the hashtables into "sequential mode" to avoid locking overhead.
     dict_set_sequential(global.values);
+#ifdef NUM_SHARDS
+    if (NUM_SHARDS < global.nworkers) {
+        for (unsigned int si = 0; si < NUM_SHARDS; si++) {
+            dict_set_sequential(global.shards[si].states);
+        }
+    }
+#endif
 #ifndef NEW_STUFF
     dict_set_sequential(visited);
 #endif
