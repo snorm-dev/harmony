@@ -337,6 +337,7 @@ struct dict_assoc *dict_find_new(struct dict *dict, struct allocator *al,
         da_set(k, db->unstable);
         db->unstable = k;
         dict_unstable(dict, al, index, k);
+	mutex_release(*lock);
     }
     else {
         da_set(k, db->stable);

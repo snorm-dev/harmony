@@ -152,10 +152,6 @@ struct results_block {
 // holds the states that hash onto the index into the array.
 struct shard {
     struct dict *states;          // maps states to nodes
-
-    struct results_block *todo_buffer, *tb_head, *tb_tail;
-    unsigned int tb_size, tb_index;
-    bool idle;                    // nothing on TODO list
 };
 
 // One of these per worker thread
@@ -173,6 +169,12 @@ struct worker {
     struct failure *failures;    // list of discovered failures (not data races)
 
     struct state_header **peers;  // peers[nshards]
+
+    mutex_t todo_lock;
+    struct results_block *todo_buffer, *tb_head, *tb_tail;
+    unsigned int tb_size;
+    unsigned int tb_index;
+    bool idle;                    // nothing on TODO list
 
     // The worker thread loop through three phases:
     //  1: model check part of the state space
@@ -736,8 +738,8 @@ static void process_step(
 
     // Add to the linked list of the responsible peer shard
     unsigned int shard_responsible = (sh->hash >> 16) % global.nshards;
-    unsigned int workers_per_shard = global.workers_per_shard[shard_responsible];
-    unsigned int responsible = (sh->hash >> 8) % global.workers_per_shard[shard_responsible] + global.first_worker_per_shard[shard_responsible];
+    unsigned int workers_per_shard = global.nworkers / global.nshards;
+    unsigned int responsible = ((sh->hash >> 8) % workers_per_shard) * global.nshards + shard_responsible;
     sh->next = w->peers[responsible];
 
     w->peers[responsible] = sh;
@@ -2478,29 +2480,67 @@ void do_work1(struct worker *w, unsigned int shard_index, struct node *node){
 static void do_work(struct worker *w, unsigned int shard_index){
     struct shard *shard = &global.shards[shard_index];
 
-    // printf("WORK 1: %u: %u %u\n", w->index, shard->tb_index, shard->tb_size);
-    memset(w->peers, 0, global.nshards * sizeof(*w->peers));
-    while (shard->tb_index < shard->tb_size) {
-		// printf("WORK 1: %u: do %u\n", w->index, shard->tb_index);
-        struct node *n = shard->tb_head->results[shard->tb_index % NRESULTS];
-        do_work1(w, shard_index, n);
-        shard->tb_index++;
-        if (shard->tb_index % NRESULTS == 0) {
-            shard->tb_head = shard->tb_head->next;
+    // printf("WORK: %u: %u %u\n", w->index, w->tb_index, w->tb_size);
+    memset(w->peers, 0, global.nworkers * sizeof(*w->peers));
+    while (true) {
+        mutex_acquire(&w->todo_lock);
+        if (w->tb_index >= w->tb_size) {
+            mutex_release(&w->todo_lock);
+            break;
         }
+        struct node *n = w->tb_head->results[w->tb_index % NRESULTS];
+        w->tb_index++;
+        if (w->tb_index % NRESULTS == 0) {
+            w->tb_head = w->tb_head->next;
+        }
+        mutex_release(&w->todo_lock);
+
+
+        // printf("DO_WORK 1: %u: %u %u\n", w->index, w->tb_index-1, w->tb_size);
+        do_work1(w, shard_index, n);
+        // printf("DONE_WORK 1: %u: %u %u\n", w->index, w->tb_index-1, w->tb_size);
 
         // Stop if about to run out of state buffer space
         if (w->sb_index > STATE_BUFFER_HWM) {
             break;
         }
     }
-    // printf("WORK 1: %u DONE\n", w->index);
+    // printf("WORK: %u DONE\n", w->index);
 }
+
+static bool steal_work(struct worker *w_thief, struct worker *w_victim, unsigned int shard_index) {
+    // printf("try steal: %u from %u\n", w_thief->index, w_victim->index);
+
+    while (true) {
+        mutex_acquire(&w_victim->todo_lock);
+        if (w_victim->tb_index >= w_victim->tb_size) {
+            mutex_release(&w_victim->todo_lock);
+            return true;
+        }
+        // printf("get victim node: %u from %u\n", w_thief->index, w_victim->index);
+        struct node *n = w_victim->tb_head->results[w_victim->tb_index % NRESULTS];
+        w_victim->tb_index++;
+        if (w_victim->tb_index % NRESULTS == 0) {
+            w_victim->tb_head = w_victim->tb_head->next;
+        }
+        mutex_release(&w_victim->todo_lock);
+
+        // printf("do steal: %u from %u\n", w_thief->index, w_victim->index);
+        do_work1(w_thief, shard_index, n);
+        // printf("done steal: %u from %u\n", w_thief->index, w_victim->index);
+        // Stop if about to run out of state buffer space
+        if (w_thief->sb_index > STATE_BUFFER_HWM) {
+            return false;
+        }
+    }
+    return true;
+}
+
 
 static void do_work2(struct worker *w, unsigned int shard_index){
     struct shard *shard = &global.shards[shard_index]; 
 
-    // printf("WORK 2: %u: %u %lu\n", w->index, shard->sb_index, sizeof(shard->state_buffer));
+    // printf("WORK 2: %u: %u %lu\n", w->index, w->sb_index, sizeof(w->state_buffer));
 
     for (unsigned int i = 0; i < global.nworkers; i++) {
         struct worker *w2 = &global.workers[i];
@@ -2513,8 +2553,10 @@ static void do_work2(struct worker *w, unsigned int shard_index){
             bool new;
 #ifdef NUM_SHARDS
             mutex_t *lock;
+            // printf("check dict: %u\n", w->index);
             struct dict_assoc *hn = dict_find_new(shard->states, &w->allocator,
                         sc, size, sh->noutgoing * sizeof(struct edge), &new, &lock, sh->hash);
+            // printf("done check dict: %u\n", w->index);
 #else
             struct dict_assoc *hn = dict_find_new(shard->states, &w->allocator, sc, size, sh->noutgoing * sizeof(struct edge), &new, NULL, sh->hash);
 #endif
@@ -2529,18 +2571,18 @@ static void do_work2(struct worker *w, unsigned int shard_index){
                 next->len = sh->node->len + 1;
                 next->nedges = sh->noutgoing;
 
-                assert(shard->tb_tail->nresults == shard->tb_size % NRESULTS);
-                assert(shard->tb_tail->next == NULL);
-                shard->tb_size++;
-                shard->tb_tail->results[shard->tb_tail->nresults++] = next;
-                if (shard->tb_tail->nresults == NRESULTS) {
-                    struct results_block *rb = walloc_fast(w, sizeof(*shard->tb_tail));
+                assert(w->tb_tail->nresults == w->tb_size % NRESULTS);
+                assert(w->tb_tail->next == NULL);
+                w->tb_size++;
+                w->tb_tail->results[w->tb_tail->nresults++] = next;
+                if (w->tb_tail->nresults == NRESULTS) {
+                    struct results_block *rb = walloc_fast(w, sizeof(*w->tb_tail));
                     rb->nresults = 0;
                     rb->next = NULL;
-                    shard->tb_tail->next = rb;
-                    shard->tb_tail = rb;
+                    w->tb_tail->next = rb;
+                    w->tb_tail = rb;
                 }
-                assert(shard->tb_tail->nresults == shard->tb_size % NRESULTS);
+                assert(w->tb_tail->nresults == w->tb_size % NRESULTS);
 
 #ifndef NEW_STUFF
                 w->count++;
@@ -2558,7 +2600,7 @@ static void do_work2(struct worker *w, unsigned int shard_index){
     }
 
     assert(shard->tb_index <= shard->tb_size);
-    shard->idle = shard->tb_index == shard->tb_size;
+    w->idle = w->tb_index == w->tb_size;
 
     // printf("WORK 2: %u DONE\n", w->index);
 }
@@ -2873,13 +2915,13 @@ static void worker(void *arg){
     for (;;) {
         // Wait for the first barrier (and keep stats)
         // This is where the worker is waiting for stabilizing hash tables
-        if (w->index == 1) {
-            // printf("WAIT FOR START %u\n", w->index);
-        }
+        // if (w->index == 1) {
+        //     printf("WAIT FOR START %u\n", w->index);
+        // }
         barrier_wait(w->start_barrier);
-        if (w->index == 1) {
-            // printf("DONE WITH START %u\n", w->index);
-        }
+        // if (w->index == 1) {
+        //     printf("DONE WITH START %u\n", w->index);
+        // }
         double after = gettime();
         w->start_wait += after - before;
         w->start_count++;
@@ -2891,8 +2933,8 @@ static void worker(void *arg){
             break;
         }
         done = true;
-        for (unsigned int i = 0; i < global.nshards; i++) {
-            if (!global.shards[i].idle) {
+        for (unsigned int i = 0; i < global.nworkers; i++) {
+            if (!global.workers[i].idle) {
                 done = false;
             }
         }
@@ -2913,6 +2955,15 @@ static void worker(void *arg){
                 dict_make_stable(global.shards[si].states, w->index);
             }
             do_work(w, w->index % global.nshards);
+
+            struct worker *w_victim;
+            for (unsigned int j = 1; j < global.nworkers; j++) {
+                w_victim = &global.workers[(j + w->index) % global.nworkers]; // make offset random?
+                bool continue_stealing = steal_work(w, w_victim, w->index % global.nshards);
+                if (!continue_stealing) {
+                    break;
+                }
+            }
         } else for (;;) {
             unsigned int shard_index = atomic_fetch_add(&global.sh_index1, 1);
             if (shard_index >= global.nshards) {
@@ -2945,13 +2996,13 @@ static void worker(void *arg){
         // Wait for others to finish, and keep stats
         // Here we are waiting for everybody's todo list processing
         before = after;
-        if (w->index == 1) {
-            // printf("WAIT FOR MIDDLE %u\n", w->index);
-        }
+        // if (w->index == 1) {
+        //     printf("WAIT FOR MIDDLE %u\n", w->index);
+        // }
         barrier_wait(w->middle_barrier);
-        if (w->index == 1) {
-            // printf("DONE WITH MIDDLE %u\n", w->index);
-        }
+        // if (w->index == 1) {
+        //     printf("DONE WITH MIDDLE %u\n", w->index);
+        // }
         after = gettime();
         w->middle_wait += after - before;
         w->middle_count++;
@@ -3015,10 +3066,14 @@ static void worker(void *arg){
         // The only parallelism here is that workers 1 and 2 grow different
         // hash tables, while worker 0 deals with the graph table
         if (w->index == 1 % global.nworkers) {
+            // printf("start prepare global.values\n");
             dict_grow_prepare(global.values);
+            // printf("done prepare global.values\n");
         }
         if (w->index == 2 % global.nworkers) {
+            // printf("start prepare global.computations\n");
             dict_grow_prepare(global.computations);
+            // printf("done prepare global.computations\n");
         }
 
         // Start the final phase (and keep stats).
@@ -3027,13 +3082,13 @@ static void worker(void *arg){
         after = gettime();
         w->phase2b += after - before;
         before = after;
-        if (w->index >= 1) {
-            printf("WAIT FOR END %u\n", w->index);
-        }
+        // if (w->index == 1) {
+        //     printf("WAIT FOR END %u\n", w->index);
+        // }
         barrier_wait(w->end_barrier);
-        if (w->index == 1) {
-            // printf("DONE WITH END %u\n", w->index);
-        }
+        // if (w->index == 1) {
+        //     printf("DONE WITH END %u\n", w->index);
+        // }
         after = gettime();
         w->end_wait += after - before;
         w->end_count++;
@@ -3957,6 +4012,11 @@ int exec_model_checker(int argc, char **argv){
         w->allocator.ctx = w;
         w->allocator.worker = i;
 
+        w->todo_buffer = w->tb_head = w->tb_tail = walloc_fast(w, sizeof(*w->tb_tail));
+        w->todo_buffer->nresults = 0;
+        w->todo_buffer->next = NULL;
+        mutex_init(&w->todo_lock); 
+
 #ifdef SHARDS_PER_WORKER
         // Initialize the shards assigned to this worker
         unsigned int first_shard = i * SHARDS_PER_WORKER;
@@ -3975,9 +4035,6 @@ int exec_model_checker(int argc, char **argv){
     for (unsigned int si = 0; si < NUM_SHARDS; si++) {
         struct shard *shard = &global.shards[si];
         shard->states = dict_new("shard states", sizeof(struct node), 0, global.nworkers, false);
-        shard->todo_buffer = shard->tb_head = shard->tb_tail = walloc_fast(&global.workers[si % global.nworkers], sizeof(*shard->tb_tail));
-        shard->todo_buffer->nresults = 0;
-        shard->todo_buffer->next = NULL;
         if (NUM_SHARDS < global.nworkers) {
             dict_set_concurrent(shard->states);
         }
@@ -4020,11 +4077,11 @@ int exec_model_checker(int argc, char **argv){
     node->nedges = 1;
     memset(node_edges(node), 0, sizeof(struct edge));
 
-    // Add node to the todo list of shard 0
+    // Add node to the todo list of worker 0
     // TODO.  Should probably just add the state, not the node
-    global.shards[0].todo_buffer->results[0] = node;
-    global.shards[0].todo_buffer->nresults = 1;
-    global.shards[0].tb_size = 1;
+    global.workers[0].todo_buffer->results[0] = node;
+    global.workers[0].todo_buffer->nresults = 1;
+    global.workers[0].tb_size = 1;
 #else
     dict_set_concurrent(visited);
 
@@ -4067,14 +4124,14 @@ int exec_model_checker(int argc, char **argv){
 
 #ifdef NEW_STUFF
     unsigned int nstates = 0;
-    for (unsigned int i = 0; i < global.nshards; i++) {
+    for (unsigned int i = 0; i < global.nworkers; i++) {
         // printf("W%u: %u\n", i, workers[i].shard.tb_size);
-        nstates += global.shards[i].tb_size;
+        nstates += global.workers[i].tb_size;
     }
     graph_add_multiple(&global.graph, nstates);
     unsigned int node_id = 0;
-    for (unsigned int i = 0; i < global.nshards; i++) {
-        for (struct results_block *rb = global.shards[i].todo_buffer; rb != NULL; rb = rb->next) {
+    for (unsigned int i = 0; i < global.nworkers; i++) {
+        for (struct results_block *rb = global.workers[i].todo_buffer; rb != NULL; rb = rb->next) {
             for (unsigned int k = 0; k < rb->nresults; k++) {
                 struct node *n = rb->results[k];
                 n->id = node_id;
