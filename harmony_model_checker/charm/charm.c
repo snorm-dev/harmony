@@ -4,8 +4,8 @@
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#include "charm.h"
 #endif
+
 
 #define NEW_STUFF
 
@@ -738,8 +738,14 @@ static void process_step(
 
     // Add to the linked list of the responsible peer shard
     unsigned int shard_responsible = (sh->hash >> 16) % global.nshards;
-    unsigned int workers_per_shard = global.nworkers / global.nshards;
-    unsigned int responsible = ((sh->hash >> 8) % workers_per_shard) * global.nshards + shard_responsible;
+
+    unsigned int responsible;
+    if (global.nworkers > global.nshards) {
+        unsigned int workers_per_shard = global.nworkers / global.nshards;
+        responsible = ((sh->hash >> 8) % workers_per_shard) + shard_responsible * workers_per_shard;
+    } else {
+        responsible = shard_responsible % global.nworkers;
+    }
     sh->next = w->peers[responsible];
 
     w->peers[responsible] = sh;
@@ -2552,10 +2558,16 @@ static void do_work2(struct worker *w, unsigned int shard_index){
             // or allocate if not.
             bool new;
 #ifdef NUM_SHARDS
-            mutex_t *lock;
-            // printf("check dict: %u\n", w->index);
-            struct dict_assoc *hn = dict_find_new(shard->states, &w->allocator,
-                        sc, size, sh->noutgoing * sizeof(struct edge), &new, &lock, sh->hash);
+            struct dict_assoc *hn;
+            if (NUM_SHARDS < global.nworkers) {
+                mutex_t *lock;
+                // printf("check dict: %u\n", w->index);
+                hn = dict_find_new(shard->states, &w->allocator,
+                            sc, size, sh->noutgoing * sizeof(struct edge), &new, &lock, sh->hash);
+            } else {
+                hn = dict_find_new(shard->states, &w->allocator,
+                            sc, size, sh->noutgoing * sizeof(struct edge), &new, NULL, sh->hash);
+            }
             // printf("done check dict: %u\n", w->index);
 #else
             struct dict_assoc *hn = dict_find_new(shard->states, &w->allocator, sc, size, sh->noutgoing * sizeof(struct edge), &new, NULL, sh->hash);
@@ -2954,12 +2966,12 @@ static void worker(void *arg){
             for (unsigned int si = 0; si < NUM_SHARDS; si++) {
                 dict_make_stable(global.shards[si].states, w->index);
             }
-            do_work(w, w->index % global.nshards);
+            do_work(w, w->index / (global.nworkers / global.nshards));
 
             struct worker *w_victim;
             for (unsigned int j = 1; j < global.nworkers; j++) {
                 w_victim = &global.workers[(j + w->index) % global.nworkers]; // make offset random?
-                bool continue_stealing = steal_work(w, w_victim, w->index % global.nshards);
+                bool continue_stealing = steal_work(w, w_victim, w->index / (global.nworkers / global.nshards));
                 if (!continue_stealing) {
                     break;
                 }
@@ -3011,7 +3023,7 @@ static void worker(void *arg){
 #ifndef notdef
 #ifdef NUM_SHARDS
         if (NUM_SHARDS < global.nworkers) {
-            do_work2(w, w->index % global.nshards);
+            do_work2(w, w->index / (global.nworkers / global.nshards));
         } else for (;;) {
             unsigned int shard_index = atomic_fetch_add(&global.sh_index2, 1);
             if (shard_index >= global.nshards) {
@@ -3095,8 +3107,8 @@ static void worker(void *arg){
         before = after;
 
 #ifdef NUM_SHARDS
-        if (NUM_SHARDS < global.nworkers && w->index < global.nshards) {
-            dict_grow_prepare(global.shards[w->index].states);
+        if (NUM_SHARDS < global.nworkers && w->index % (global.nworkers / global.nshards) == 0) {
+            dict_grow_prepare(global.shards[w->index / (global.nworkers / global.nshards)].states);
         }
 #endif
 
@@ -4066,8 +4078,14 @@ int exec_model_checker(int argc, char **argv){
 #ifdef NEW_STUFF
     bool new;
 #ifdef NUM_SHARDS
-    mutex_t *lock;
-    struct dict_assoc *hn = dict_find_new(global.shards[0].states, &global.workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, &lock, meiyan((char *) state, state_size(state)));
+    struct dict_assoc *hn;
+    if (NUM_SHARDS < global.nworkers) {
+        mutex_t *lock;
+        hn = dict_find_new(global.shards[0].states, &global.workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, &lock, meiyan((char *) state, state_size(state)));
+    } else {
+        hn = dict_find_new(global.shards[0].states, &global.workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, NULL, meiyan((char *) state, state_size(state)));
+    }
+
 #else
     struct dict_assoc *hn = dict_find_new(global.shards[0].states, &workers[0].allocator, state, state_size(state), sizeof(struct edge), &new, NULL, meiyan((char *) state, state_size(state)));
 #endif
@@ -4122,6 +4140,8 @@ int exec_model_checker(int argc, char **argv){
     // Run the last worker.  When it terminates the model checking is done.
     worker(&global.workers[0]);
 
+    double after = gettime();
+
 #ifdef NEW_STUFF
     unsigned int nstates = 0;
     for (unsigned int i = 0; i < global.nworkers; i++) {
@@ -4161,9 +4181,9 @@ int exec_model_checker(int argc, char **argv){
                 w->phase2a,
                 w->phase2b,
                 w->phase3,
-                w->start_wait/w->start_count,
-                w->middle_wait/w->middle_count,
-                w->end_wait/w->end_count,
+                w->start_wait,
+                w->middle_wait,
+                w->end_wait,
                 w->total_results,
                 w->process_step);
     }
@@ -4189,7 +4209,7 @@ int exec_model_checker(int argc, char **argv){
         end_wait / global.nworkers);
 #endif
 
-    printf("    * %u states (time %.2lfs, mem=%.3lfGB)\n", global.graph.size, gettime() - before, (double) allocated / (1L << 30));
+    printf("    * %u states (time %.2lfs, mem=%.3lfGB)\n", global.graph.size, after - before, (double) allocated / (1L << 30));
     unsigned int si_hits = 0, si_total = 0;
     for (unsigned int i = 0; i < global.nworkers; i++) {
         struct worker *w = &global.workers[i];

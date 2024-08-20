@@ -513,13 +513,13 @@ void dict_grow_prepare(struct dict *dict){
     dict->old_table = dict->table;
 
     unsigned int total = 0;
-	for (unsigned int i = 0; i < dict->nworkers; i++) {
+    for (unsigned int i = 0; i < dict->nworkers; i++) {
         struct dict_worker *dw = &dict->workers[i];
         total += dw->count;
         dw->count = 0;
     }
     dict->count += total;
-	if ((double) dict->count / dict->length > dict->growth_threshold) {
+    if ((double) dict->count / dict->length > dict->growth_threshold) {
         int factor = dict->growth_factor;
         while (factor * dict->length < dict->count) {
             factor++;
